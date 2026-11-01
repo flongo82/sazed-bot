@@ -13,6 +13,8 @@
 // "Inbox" PRIMA di rispondere 200 a Telegram. Se l'agente è collegato il messaggio gli
 // viene spinto subito; altrimenti resta in coda e l'utente riceve un avviso.
 // Un elemento esce dalla coda solo quando l'agente conferma di averlo registrato al sicuro (ack).
+// /start lo gestisce il Worker; il comando di stato anche, ma solo ad agente scollegato: se
+// è collegato va a lui come ogni messaggio, e il Worker risponde solo se non lo conferma.
 //
 // I testi per l'utente stanno in messages.js, uno per lingua (LANGUAGE in wrangler.jsonc).
 
@@ -79,6 +81,12 @@ async function handleTelegram(request, env, ctx) {
 
   if (command === "/start" || STATUS_COMMANDS.has(command)) {
     const status = await inbox.status();
+    // Con l'agente collegato il comando di stato va a lui, che conosce anche il suo registro.
+    // Se non lo conferma entro AGENT_STATUS_GRACE_SECONDS, risponde il Worker (vedi alarm()).
+    if (command !== "/start" && status.agentOnline) {
+      await inbox.enqueue(update, { statusGrace: true });
+      return new Response("ok");
+    }
     notify(ctx, env, msg, () => {
       const { t, hello, name } = voice(env, from);
       const state = `${agentText(t, status, name)}. ${t.pending(status.pending)}`;
@@ -135,6 +143,12 @@ function commandOf(msg) {
   const text = msg?.text ?? "";
   if (!text.startsWith("/")) return null;
   return text.split(/[\s@]/)[0].toLowerCase();
+}
+
+// La risposta del Worker a un comando di stato che l'agente collegato non ha confermato.
+function silentStatusText(env, from, pending) {
+  const { t, hello, name } = voice(env, from);
+  return `${hello}, ${t.agentSilent(name)}. ${t.pending(pending)}`;
 }
 
 function agentText(t, s, name) {
@@ -304,8 +318,14 @@ export class Inbox extends DurableObject {
     return rows.length ? rows[0].value : null;
   }
 
-  // RPC chiamato dal Worker per ogni messaggio dell'utente.
-  async enqueue(update) {
+  statusGraceMs() {
+    const s = Number(this.env.AGENT_STATUS_GRACE_SECONDS);
+    return (Number.isFinite(s) && s > 0 ? s : 15) * 1000;
+  }
+
+  // RPC chiamato dal Worker per ogni messaggio dell'utente. Con statusGrace (un comando di
+  // stato passato all'agente) programma l'allarme che controlla se l'agente lo ha confermato.
+  async enqueue(update, { statusGrace = false } = {}) {
     const payload = JSON.stringify(update);
     const agentOnline = this.isAgentOnline();
     // Telegram può riconsegnare lo stesso aggiornamento: in quel caso non facciamo nulla.
@@ -323,8 +343,38 @@ export class Inbox extends DurableObject {
       for (const ws of this.agentSockets()) {
         try { ws.send(frame); } catch { /* connessione morta: resta in coda */ }
       }
+      if (statusGrace) await this.scheduleAlarm(Date.now() + this.statusGraceMs());
     }
     return { added, agentOnline, lastSeen: this.lastSeenAt(), pending: this.pendingCount() };
+  }
+
+  // Un solo allarme per oggetto: si anticipa se serve prima, non si posticipa mai.
+  async scheduleAlarm(at) {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
+  }
+
+  // Un comando di stato passato all'agente e non confermato entro il tempo previsto riceve la
+  // risposta del Worker e lascia la coda: è una domanda, non un contenuto da custodire. Se
+  // Telegram non risponde, l'eccezione fa ripetere l'allarme e il comando resta in coda.
+  async alarm() {
+    const now = Date.now();
+    const grace = this.statusGraceMs();
+    let next = null;
+    const rows = this.sql.exec("SELECT id, received_at, payload FROM queue ORDER BY id").toArray();
+    for (const row of rows) {
+      const update = JSON.parse(row.payload);
+      const msg = update.message ?? update.edited_message;
+      if (!STATUS_COMMANDS.has(commandOf(msg))) continue;
+      if (now - row.received_at < grace) {
+        next = Math.min(next ?? Infinity, row.received_at + grace);
+        continue;
+      }
+      const sent = await reply(this.env, msg, silentStatusText(this.env, msg.from, this.pendingCount() - 1));
+      if (!sent.ok) throw new Error(`risposta di riserva non inviata: ${sent.description}`);
+      this.sql.exec("DELETE FROM queue WHERE id = ?", row.id);
+    }
+    if (next !== null) await this.ctx.storage.setAlarm(next);
   }
 
   // RPC per /start e il comando di stato.

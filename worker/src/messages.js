@@ -11,6 +11,7 @@ export const MESSAGES = {
     agentOnline: (name) => `l'agente ${name} è collegato`,
     agentOffline: (name, when) => `l'agente ${name} non è collegato (ultimo contatto ${when})`,
     agentNever: (name) => `l'agente ${name} non si è mai collegato finora`,
+    agentSilent: (name) => `l'agente ${name} è collegato ma non risponde`,
     queued: "ho messo il messaggio in coda e lo elaborerà appena si collega",
     pending: (n) => `Messaggi da processare: ${n}.`,
     ago: {
@@ -29,6 +30,7 @@ export const MESSAGES = {
     agentOnline: (name) => `the ${name} agent is connected`,
     agentOffline: (name, when) => `the ${name} agent is not connected (last seen ${when})`,
     agentNever: (name) => `the ${name} agent has never connected so far`,
+    agentSilent: (name) => `the ${name} agent is connected but not responding`,
     queued: "your message is queued and will be processed as soon as it connects",
     pending: (n) => `Messages to process: ${n}.`,
     ago: {

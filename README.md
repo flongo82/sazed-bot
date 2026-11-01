@@ -222,9 +222,13 @@ Messages on the WebSocket:
   or broken item never holds up the queue here.
 - An item that was not acknowledged is delivered again on the next connection, so the agent
   must skip the `update_id`s it has already recorded.
-- `/start` and the status command (`/stato` in Italian, `/status` in English, both always
-  accepted; its name comes from the text catalog) are answered by the Worker itself;
-  everything else goes to the agent.
+- `/start` is answered by the Worker itself; everything else goes to the agent.
+- The status command (`/stato` in Italian, `/status` in English, both always accepted; its
+  name comes from the text catalog) is answered by the Worker only while the agent is offline.
+  When the agent is connected, the command is delivered to it like any other message, since
+  only the agent knows its own journal. If the agent does not acknowledge it within
+  `AGENT_STATUS_GRACE_SECONDS` (15 by default), a Durable Object alarm makes the Worker answer
+  by itself ("connected but not responding") and drop the command from the queue.
 
 ## Uninstall
 

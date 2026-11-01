@@ -41,6 +41,7 @@ async function startWorker(allowedUser, language = "auto", dir = persist) {
   const vars = {
     WEBHOOK_SECRET: SECRET, AGENT_TOKEN, TELEGRAM_BOT_TOKEN: "TESTTOKEN",
     ALLOWED_USER_ID: allowedUser, TELEGRAM_API_BASE: MOCK, AGENT_TIMEOUT_SECONDS: "3", BOT_NAME,
+    AGENT_STATUS_GRACE_SECONDS: "1",
     LANGUAGE: language,
   };
   // Il modello di configurazione, non quella personale: il test non dipende da configure.sh.
@@ -255,12 +256,30 @@ try {
   const acked = await waitFor(ws, (m) => m.type === "acked" && m.id === backlogItem.id);
   check("dopo l'ack l'elemento esce dalla coda", acked?.pending === 1, JSON.stringify(acked));
 
+  // Agente collegato: il comando di stato va a lui come ogni messaggio, e il Worker tace.
   n = calls.length;
-  await post(makeUpdate("/stato"));
-  c = await newCalls(n);
-  check("/stato ad agente collegato",
-    c[0]?.body.text === `Ciao ${FIRST_NAME}, l'agente ${BOT_NAME} è collegato. Messaggi da processare: 1.`,
-    c[0]?.body.text);
+  const statusUpdate = makeUpdate("/stato");
+  await post(statusUpdate);
+  const forwarded = await waitFor(ws, (m) => m.type === "update" && m.update.update_id === statusUpdate.update_id, 1000);
+  check("/stato ad agente collegato → passa all'agente, il Worker non risponde",
+    Boolean(forwarded) && (await newCalls(n)).length === 0);
+  ws.send(JSON.stringify({ type: "ack", id: forwarded.id }));
+  await waitFor(ws, (m) => m.type === "acked" && m.id === forwarded.id);
+  await sleep(1500); // oltre AGENT_STATUS_GRACE_SECONDS (1 s nel test)
+  check("…confermato dall'agente: nessuna risposta di riserva del Worker", (await newCalls(n, 0)).length === 0);
+
+  // Agente collegato che non conferma: passato il tempo previsto risponde il Worker.
+  n = calls.length;
+  const unanswered = makeUpdate("/status", { lang: "en" });
+  await post(unanswered);
+  const forwarded2 = await waitFor(ws, (m) => m.type === "update" && m.update.update_id === unanswered.update_id, 1000);
+  await sleep(1800);
+  c = await newCalls(n, 0);
+  check("agente collegato che non conferma /status → passato il tempo previsto risponde il Worker",
+    Boolean(forwarded2) && c.length === 1 &&
+    c[0].body.text === `Hi ${FIRST_NAME}, the ${BOT_NAME} agent is connected but not responding. Messages to process: 1.` &&
+    c[0].body.reply_parameters?.message_id === unanswered.message.message_id,
+    JSON.stringify(c));
 
   clearInterval(pinger);
   ws.close();
@@ -278,6 +297,8 @@ try {
   await waitFor(ws, (m) => m.type === "backlog_end");
   const redelivered = ws.inbox.find((m) => m.type === "update" && m.update.update_id === second.update_id);
   check("un elemento non confermato viene riconsegnato alla riconnessione", Boolean(redelivered));
+  check("…ma non il comando di stato già risposto dal Worker",
+    !ws.inbox.some((m) => m.type === "update" && m.update.update_id === unanswered.update_id));
   ws.send(JSON.stringify({ type: "ack", id: redelivered.id }));
   const acked2 = await waitFor(ws, (m) => m.type === "acked" && m.id === redelivered.id);
   check("coda vuota dopo l'ultimo ack", acked2?.pending === 0, JSON.stringify(acked2));
@@ -377,10 +398,10 @@ try {
   ws = await connectAgent();
   ws.send("ping");
   n = calls.length;
-  await post(makeUpdate("/status", { lang: "en" }));
+  await post(makeUpdate("/start", { lang: "en" }));
   c = await newCalls(n);
-  check("/status in inglese ad agente collegato",
-    c[0]?.body.text === `Hi ${FIRST_NAME}, the ${BOT_NAME} agent is connected. Messages to process: 1.`, c[0]?.body.text);
+  check("/start in inglese ad agente collegato",
+    c[0]?.body.text.endsWith(`\n\nThe ${BOT_NAME} agent is connected. Messages to process: 1.`), c[0]?.body.text);
   ws.close();
   await stopWorker();
 } catch (err) {
