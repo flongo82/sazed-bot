@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // Template. scripts/configure.sh copies it to wrangler.jsonc (ignored by git) with your
+  // Worker's name and your bot's name: edit wrangler.jsonc, not this file.
+  "name": "sazed-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // The queue lives in a single Durable Object with SQLite storage (included in the free plan).
+  "durable_objects": {
+    "bindings": [{ "name": "INBOX", "class_name": "Inbox" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Inbox"] }],
+
+  // Non-secret values. The secrets (TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, AGENT_TOKEN,
+  // ALLOWED_USER_ID) are set with "npx wrangler secret put" and never live in this file.
+  // LANGUAGE: language of the bot's messages, "auto" (the user's Telegram app) or a language of
+  // src/messages.js ("it", "en").
+  "vars": {
+    "BOT_NAME": "sazed",
+    "LANGUAGE": "auto",
+    "TELEGRAM_API_BASE": "https://api.telegram.org",
+    "AGENT_TIMEOUT_SECONDS": "90"
+  }
+}

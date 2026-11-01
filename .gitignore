@@ -1,0 +1,6 @@
+# Tutto ciò che si installa o si genera localmente resta fuori dal repository
+node/
+.config/
+.npm-cache/
+secrets/
+*.tar.gz

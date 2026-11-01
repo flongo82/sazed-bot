@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+.config/
+.npm-cache/
+
+# Configurazione personale, generata da scripts/configure.sh
+wrangler.jsonc
