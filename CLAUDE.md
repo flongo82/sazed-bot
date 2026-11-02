@@ -31,7 +31,12 @@ npx wrangler tail                  # log in tempo reale del Worker pubblicato
 ## Regole
 
 - Il protocollo WebSocket descritto nel README è un contratto con `sazed-agent`.
-  Se lo modifichi, aggiorna il README e segnala che va aggiornato anche l'altro repository.
+  Se lo modifichi, aggiorna il README e segnala che va aggiornato anche l'altro repository;
+  la prova di contratto di `sazed-agent` (`scripts/contract-test.sh`) fa girare il vero agente
+  contro questo codice e deve passare.
+- Gli elementi partono verso l'agente solo da `Inbox.pump()`: dopo `hello`, in ordine, con al
+  massimo `AGENT_WINDOW` in attesa di ack. Non aggiungere altre strade: ordine e finestra
+  dipendono da questo. Ciò che arriva da una connessione sostituita (sessione vecchia) si ignora.
 - Un messaggio va scritto nella coda PRIMA di rispondere 200 a Telegram, ed esce dalla coda
   solo con l'ack dell'agente: non cambiare quest'ordine, è ciò che garantisce di non perdere nulla.
 - Il repository è pubblico: niente che permetta di raggiungere un'istanza (nome del Worker,

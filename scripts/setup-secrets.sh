@@ -4,7 +4,9 @@
 #   - ALLOWED_USER_ID: the only Telegram user the bot listens to. If you don't know your ID,
 #     the script finds it: you write to your bot and confirm that the sender is you.
 #   - WEBHOOK_SECRET and AGENT_TOKEN are generated at random. AGENT_TOKEN is also saved in
-#     secrets/agent_token (readable only by you), because sazed-agent needs it.
+#     secrets/agent_token (readable only by you), because sazed-agent needs it, and kept as it is
+#     when the script runs again; WEBHOOK_SECRET is new every time, so the webhook is registered
+#     again at once if the Worker's address is already known.
 set -euo pipefail
 
 SAZED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,21 +52,19 @@ USER_ID="$(printf '%s' "$USER_ID" | tr -d '[:space:]')"
 if [ -z "$USER_ID" ]; then
   read -rp "Send any message to @$BOT_USERNAME from your Telegram account, then press Enter here. "
   # One line per sender in a private chat: id, then a description. "WEBHOOK" if Telegram
-  # refuses because a webhook is already set; the last line is the highest update_id.
+  # refuses because a webhook is already set. The messages are only read, not consumed: once
+  # the webhook is set they reach the Worker, which keeps yours and drops everyone else's.
   SENDERS="$(telegram "getUpdates?timeout=0" | node -e '
     const r = JSON.parse(require("fs").readFileSync(0, "utf8"));
     if (!r.ok) { console.log(r.error_code === 409 ? "WEBHOOK" : "ERROR " + r.description); process.exit(0); }
     const seen = new Map();
-    let last = 0;
     for (const u of r.result) {
-      last = Math.max(last, u.update_id);
       const m = u.message;
       if (m?.chat?.type !== "private" || !m.from || seen.has(m.from.id)) continue;
       const f = m.from;
       seen.set(f.id, [f.first_name, f.last_name, f.username && "@" + f.username].filter(Boolean).join(" "));
     }
     for (const [id, who] of seen) console.log(id + "\t" + who);
-    console.log("LAST\t" + last);
   ')"
   case "$SENDERS" in
     WEBHOOK)
@@ -77,13 +77,10 @@ if [ -z "$USER_ID" ]; then
       ;;
     *)
       while IFS=$'\t' read -r id who <&3; do
-        [ "$id" = "LAST" ] && continue
+        [ -n "$id" ] || continue
         read -rp "Message from $who (ID $id). Is this you? [y/N] " answer
         if [[ "$answer" =~ ^[yY] ]]; then USER_ID="$id"; break; fi
       done 3<<< "$SENDERS"
-      # Marks the messages as read, so they will not reach the Worker once the webhook is set.
-      LAST="$(grep '^LAST' <<< "$SENDERS" | cut -f2)"
-      [ "$LAST" -gt 0 ] && telegram "getUpdates?timeout=0&offset=$((LAST + 1))" > /dev/null
       if [ -z "$USER_ID" ]; then
         echo "No message from you yet: write to @$BOT_USERNAME and run the script again." >&2
         exit 1
@@ -113,4 +110,10 @@ openssl rand -hex 32 | tr -d '\n' | npx wrangler secret put WEBHOOK_SECRET
 npx wrangler secret put AGENT_TOKEN < "$SAZED_DIR/secrets/agent_token"
 
 echo
-echo "Secrets set. Now run: ../scripts/set-webhook.sh <your Worker's address>"
+if [ -s "$SAZED_DIR/secrets/worker_url" ]; then
+  # Telegram must learn the new WEBHOOK_SECRET now: until then, the Worker refuses its calls.
+  echo "Secrets set. Registering the webhook again, with the new secret:"
+  "$SAZED_DIR/scripts/set-webhook.sh" "$(cat "$SAZED_DIR/secrets/worker_url")"
+else
+  echo "Secrets set. Now run: ../scripts/set-webhook.sh <your Worker's address>"
+fi

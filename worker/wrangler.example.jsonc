@@ -24,6 +24,8 @@
     "LANGUAGE": "auto",
     "TELEGRAM_API_BASE": "https://api.telegram.org",
     "AGENT_TIMEOUT_SECONDS": "90",
-    "AGENT_STATUS_GRACE_SECONDS": "15"
+    "AGENT_STATUS_GRACE_SECONDS": "15",
+    // Messages sent to the agent and not yet acknowledged, at most: a long backlog leaves in steps.
+    "AGENT_WINDOW": "50"
   }
 }

@@ -1,8 +1,8 @@
 // Test end-to-end del Worker in locale (wrangler dev), con un finto server Telegram.
 // Uso: npm test   (dalla cartella worker, dopo "source ../env.sh" e "npm install")
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -18,15 +18,28 @@ const BOT_NAME = "Custode";
 const FIRST_NAME = "Ada";
 
 // ---------------------------------------------------------------- finto Telegram
+// Risponde come Telegram. I metodi in `failing` falliscono; getWebhookInfo restituisce l'URL
+// dell'ultimo setWebhook, oppure `foreignWebhook` per simulare un webhook rimasto altrove.
 const calls = [];
+const failing = new Set();
+let webhookUrl = "";
+let foreignWebhook = null;
 const mock = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
     const method = req.url.split("/").pop();
-    calls.push({ method, body: body ? JSON.parse(body) : {} });
+    const params = body ? JSON.parse(body) : {};
+    calls.push({ method, body: params });
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ ok: true, result: method === "getWebhookInfo" ? { url: "x" } : true }));
+    if (failing.has(method)) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ ok: false, error_code: 500, description: "errore finto" }));
+      return;
+    }
+    if (method === "setWebhook") webhookUrl = params.url;
+    const result = method === "getWebhookInfo" ? { url: foreignWebhook ?? webhookUrl, pending_update_count: 0 } : true;
+    res.end(JSON.stringify({ ok: true, result }));
   });
 });
 await new Promise((r) => mock.listen(0, "127.0.0.1", r));
@@ -35,13 +48,15 @@ const MOCK = `http://127.0.0.1:${mock.address().port}`;
 // ---------------------------------------------------------------- wrangler dev
 const persist = mkdtempSync(join(tmpdir(), "sazed-bot-test-"));
 let fresh; // archivio nuovo per la fase 4
+let delivery; // archivio nuovo per la fase 5
 let dev;
+let devLog = ""; // uscita di wrangler dev, per cercarvi errori del Worker
 
 async function startWorker(allowedUser, language = "auto", dir = persist) {
   const vars = {
     WEBHOOK_SECRET: SECRET, AGENT_TOKEN, TELEGRAM_BOT_TOKEN: "TESTTOKEN",
     ALLOWED_USER_ID: allowedUser, TELEGRAM_API_BASE: MOCK, AGENT_TIMEOUT_SECONDS: "3", BOT_NAME,
-    AGENT_STATUS_GRACE_SECONDS: "1",
+    AGENT_STATUS_GRACE_SECONDS: "1", AGENT_WINDOW: "3",
     LANGUAGE: language,
   };
   // Il modello di configurazione, non quella personale: il test non dipende da configure.sh.
@@ -59,14 +74,14 @@ async function startWorker(allowedUser, language = "auto", dir = persist) {
       CLOUDFLARE_CF_FETCH_ENABLED: "false", // il test non deve dipendere da internet
     },
   });
-  let log = "";
-  dev.stdout.on("data", (d) => (log += d));
-  dev.stderr.on("data", (d) => (log += d));
+  devLog = "";
+  dev.stdout.on("data", (d) => (devLog += d));
+  dev.stderr.on("data", (d) => (devLog += d));
   for (let i = 0; i < 120; i++) {
     try { if ((await fetch(`${BASE}/`)).status === 404) return; } catch { /* non ancora pronto */ }
     await sleep(500);
   }
-  throw new Error("wrangler dev non è partito:\n" + log);
+  throw new Error("wrangler dev non è partito:\n" + devLog);
 }
 
 async function stopWorker() {
@@ -93,6 +108,23 @@ function makeUpdate(text, { from = USER, updateId, chat = { id: from, type: "pri
   const id = updateId ?? nextUpdateId++;
   const sender = { id: from, first_name: FIRST_NAME, language_code: lang };
   return { update_id: id, message: { message_id: id, date: 0, from: sender, chat, text } };
+}
+
+// La pressione di un pulsante: da un messaggio del bot in una chat, o da un messaggio inline.
+function makeCallback({ chat = { id: USER, type: "private" }, inline = false } = {}) {
+  const id = nextUpdateId++;
+  const query = { id: String(id), from: { id: USER, first_name: FIRST_NAME, language_code: "it" },
+    chat_instance: "1", data: "riprova" };
+  if (inline) query.inline_message_id = "inline-1";
+  else query.message = { message_id: id, date: 0, chat, text: "un messaggio del bot" };
+  return { update_id: id, callback_query: query };
+}
+
+const updatesIn = (ws) => ws.inbox.filter((m) => m.type === "update");
+
+async function setup() {
+  const r = await fetch(`${BASE}/setup`, { method: "POST", headers: { Authorization: `Bearer ${AGENT_TOKEN}` } });
+  return { status: r.status, body: await r.json().catch(() => ({})) };
 }
 
 // Una risposta che non rivela nulla: 404 senza corpo.
@@ -404,6 +436,110 @@ try {
     c[0]?.body.text.endsWith(`\n\nThe ${BOT_NAME} agent is connected. Messages to process: 1.`), c[0]?.body.text);
   ws.close();
   await stopWorker();
+
+  console.log("Fase 5: consegna all'agente, callback e setup, archivio nuovo");
+  delivery = mkdtempSync(join(tmpdir(), "sazed-bot-test-"));
+  await startWorker(String(USER), "auto", delivery);
+  const backlog = [];
+  for (let i = 0; i < 7; i++) {
+    backlog.push(makeUpdate(`nota ${i}`));
+    await post(backlog[i]);
+  }
+  ws = await connectAgent();
+  ws.send("ping");
+  const early = makeUpdate("arrivato dopo la connessione, prima di hello");
+  await post(early);
+  await sleep(500);
+  check("prima di hello l'agente non riceve nulla", updatesIn(ws).length === 0, JSON.stringify(ws.inbox));
+  ws.send(JSON.stringify({ type: "hello" }));
+  await sleep(500);
+  check("dopo hello al massimo AGENT_WINDOW elementi senza ack (3 nel test)",
+    updatesIn(ws).length === 3 && !ws.inbox.some((m) => m.type === "backlog_end"),
+    JSON.stringify(updatesIn(ws).map((m) => m.update.update_id)));
+  const seen = [];
+  const confirmed = new Set();
+  while (seen.length < 8) {
+    const u = await waitFor(ws, (m) => m.type === "update" && !confirmed.has(m.id), 2000);
+    if (!u) break;
+    confirmed.add(u.id);
+    seen.push(u.update.update_id);
+    ws.send(JSON.stringify({ type: "ack", id: u.id }));
+  }
+  const expected = [...backlog, early].map((u) => u.update_id);
+  check("ogni ack libera il posto al successivo: tutto l'arretrato, in ordine, una volta sola",
+    JSON.stringify(seen) === JSON.stringify(expected) && updatesIn(ws).length === 8,
+    JSON.stringify(updatesIn(ws).map((m) => m.update.update_id)));
+  const ends = ws.inbox.filter((m) => m.type === "backlog_end");
+  const lastIndex = ws.inbox.findIndex((m) => m.type === "update" && m.update.update_id === early.update_id);
+  check("backlog_end una volta sola, dopo l'ultimo elemento dell'arretrato",
+    ends.length === 1 && ws.inbox.indexOf(ends[0]) > lastIndex, JSON.stringify(ends));
+  const live = makeUpdate("in diretta");
+  await post(live);
+  check("finito l'arretrato, un messaggio nuovo arriva subito",
+    Boolean(await waitFor(ws, (m) => m.type === "update" && m.update.update_id === live.update_id, 1000)));
+
+  for (const frame of ["null", "[]", "42", '"testo"', "{}", '{"type":"ack","id":"1"}']) ws.send(frame);
+  const after = makeUpdate("dopo i frame strani");
+  await post(after);
+  const afterMsg = await waitFor(ws, (m) => m.type === "update" && m.update.update_id === after.update_id, 1000);
+  await sleep(1000); // wrangler dev scrive gli errori del Worker con un po' di ritardo
+  check("frame che non sono oggetti validi: ignorati senza errori, la connessione continua",
+    Boolean(afterMsg) && !/TypeError|Uncaught/.test(devLog), devLog.slice(-800));
+  ws.send(JSON.stringify({ type: "ack", id: afterMsg?.id }));
+  await waitFor(ws, (m) => m.type === "acked" && m.id === afterMsg?.id);
+
+  const fromGroup = makeCallback({ chat: { id: -100123, type: "supergroup" } });
+  const inline = makeCallback({ inline: true });
+  const fromPrivate = makeCallback();
+  for (const u of [fromGroup, inline, fromPrivate]) await post(u);
+  await waitFor(ws, (m) => m.type === "update" && m.update.update_id === fromPrivate.update_id, 1000);
+  const delivered = updatesIn(ws).map((m) => m.update.update_id);
+  check("callback da un gruppo o da un messaggio inline → ignorato",
+    !delivered.includes(fromGroup.update_id) && !delivered.includes(inline.update_id), JSON.stringify(delivered));
+  check("callback dalla chat privata → in coda", delivered.includes(fromPrivate.update_id));
+
+  const old = ws;
+  const closed = new Promise((resolve) => old.once("close", (code) => resolve(code)));
+  ws = await connectAgent();
+  check("una nuova connessione chiude la precedente con il codice 4000",
+    (await Promise.race([closed, sleep(2000).then(() => null)])) === 4000);
+  ws.send(JSON.stringify({ type: "hello" }));
+  await waitFor(ws, (m) => m.type === "backlog_end");
+  const again = updatesIn(ws).map((m) => m.update.update_id);
+  check("la nuova connessione riceve tutto ciò che non era confermato, e solo quello",
+    JSON.stringify(again) === JSON.stringify([live.update_id, fromPrivate.update_id]), JSON.stringify(again));
+  ws.close();
+
+  failing.add("setWebhook");
+  let s = await setup();
+  check("/setup con setWebhook rifiutato da Telegram → errore, non un successo",
+    s.status === 502 && s.body.ok === false, JSON.stringify(s));
+  failing.clear();
+  foreignWebhook = "https://altrove.example/telegram";
+  s = await setup();
+  check("/setup con getWebhookInfo che indica un altro indirizzo → errore",
+    s.status === 502 && s.body.ok === false, JSON.stringify(s));
+  foreignWebhook = null;
+  failing.add("setMyCommands");
+  s = await setup();
+  check("/setup con il menu non registrato → webhook a posto, menu segnalato",
+    s.status === 200 && s.body.ok === true && s.body.commands === false, JSON.stringify(s));
+  failing.clear();
+  s = await setup();
+  check("/setup riuscito: esito complessivo e indirizzo verificato",
+    s.status === 200 && s.body.ok === true && s.body.commands === true &&
+    s.body.webhookInfo?.result?.url === `${BASE}/telegram`, JSON.stringify(s));
+  await stopWorker();
+
+  // Una copia dello script in una cartella senza segreti: anche se il controllo mancasse, non
+  // avrebbe token da inviare né un secrets/ vero da toccare.
+  const scratch = mkdtempSync(join(tmpdir(), "sazed-bot-script-"));
+  mkdirSync(join(scratch, "scripts"));
+  copyFileSync("../scripts/set-webhook.sh", join(scratch, "scripts", "set-webhook.sh"));
+  const plain = spawnSync("bash", [join(scratch, "scripts", "set-webhook.sh"), "http://127.0.0.1:1"], { encoding: "utf8" });
+  rmSync(scratch, { recursive: true, force: true });
+  check("set-webhook.sh rifiuta un indirizzo non https, prima di inviare il token",
+    plain.status === 1 && plain.stderr.includes("must start with https://"), plain.stderr);
 } catch (err) {
   console.error(err);
   failures++;
@@ -412,6 +548,7 @@ try {
   mock.close();
   rmSync(persist, { recursive: true, force: true });
   if (fresh) rmSync(fresh, { recursive: true, force: true });
+  if (delivery) rmSync(delivery, { recursive: true, force: true });
 }
 
 console.log(failures ? `\n${failures} controlli falliti` : "\nTutti i controlli superati");

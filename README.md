@@ -70,16 +70,16 @@ what keeps strangers out, and what is left to you.
 
 **What the Worker does**
 
-- It listens to one Telegram user only (`ALLOWED_USER_ID`), and only in a private chat.
-  Anyone else is ignored in silence: no reply, nothing queued. Without `ALLOWED_USER_ID`,
-  it ignores everyone.
+- It listens to one Telegram user only (`ALLOWED_USER_ID`), and only in a private chat: a
+  button press counts only if the button belongs to a message in that chat. Anyone else is
+  ignored in silence: no reply, nothing queued. Without `ALLOWED_USER_ID`, it ignores everyone.
 - Telegram's calls carry a random secret; the agent's connection a random 256-bit token.
 - Every request that is not authenticated, on any path, gets the same empty `404`: from the
   outside, the Worker reveals neither what it is nor which paths exist. Such requests never
   reach the queue.
 - The webhook can be registered only once every secret, `ALLOWED_USER_ID` included, is in
   place, and your user ID is found before that: the bot never answers anyone else, not even
-  during setup.
+  during setup. The agent token is sent only to an `https://` address.
 
 **What you should do**
 
@@ -164,8 +164,12 @@ subdomain: pick one that does not point to you. At the end it prints the Worker'
 
 Paste the bot token when asked: it is neither shown nor saved. The script then asks for your
 Telegram user ID: if you don't know it, press Enter, write anything to your bot and confirm
-that the sender is you. The other two secrets are generated at random; the agent token is
-also saved in `secrets/agent_token`, readable only by you, for `sazed-agent`.
+that the sender is you. What you write is not lost: once the webhook is set, it reaches the
+agent like any other message. The other two secrets are generated at random; the agent token
+is also saved in `secrets/agent_token`, readable only by you, for `sazed-agent`.
+
+Running the script again keeps the agent token, sets a new webhook secret and, once the
+Worker's address is known (after step 7), registers the webhook again by itself.
 
 ### 7. Connect the bot to the Worker
 
@@ -173,7 +177,9 @@ also saved in `secrets/agent_token`, readable only by you, for `sazed-agent`.
 ../scripts/set-webhook.sh https://<worker-name>.<subdomain>.workers.dev
 ```
 
-You should see `"ok": true`.
+You should see `Webhook registered and checked`: the Worker asks Telegram to deliver to it,
+then checks with `getWebhookInfo` that Telegram really does. Any failure ends with an error
+and a reason. The address is saved in `secrets/worker_url` only once everything worked.
 
 ### 8. Try it
 
@@ -202,21 +208,29 @@ The queued messages will be processed once `sazed-agent` is running.
 | `GET /agent` (WebSocket) | `sazed-agent` | header `Authorization: Bearer <AGENT_TOKEN>` |
 | `POST /setup` | `scripts/set-webhook.sh` | header `Authorization: Bearer <AGENT_TOKEN>` |
 
-Anything else, or the right path with the wrong credentials, gets an empty `404`.
+Anything else, or the right path with the wrong credentials, gets an empty `404`. `/setup`
+answers `{"ok": ..., "commands": ...}` with Telegram's own replies: `200` once the webhook is
+registered and checked, `502` if Telegram did not take it, `400` if a secret is missing.
 
 Messages on the WebSocket:
 
 | Direction | Message |
 |---|---|
 | Agent → Worker | `ping` (plain text, every ~30 s) |
-| Agent → Worker | `{"type":"hello"}` right after connecting: asks for the backlog |
+| Agent → Worker | `{"type":"hello"}` right after connecting: nothing is delivered before it |
 | Worker → Agent | `{"type":"update","id":N,"update":{...}}` for each message (`update` is Telegram's Update object) |
-| Worker → Agent | `{"type":"backlog_end","pending":N}` at the end of the backlog |
+| Worker → Agent | `{"type":"backlog_end","pending":N}` once, when the whole backlog has been sent; `N` messages still wait for their ack |
 | Agent → Worker | `{"type":"ack","id":N}` once the item is safely recorded by the agent |
 | Worker → Agent | `{"type":"acked","id":N,"pending":M}` |
 
 - Without a `ping` for 90 seconds (`AGENT_TIMEOUT_SECONDS`), the agent is considered offline.
-- Only one connection at a time: a new one closes the previous one (code 4000).
+- Messages leave in order of arrival, backlog first, and at most `AGENT_WINDOW` (50) of them
+  wait for an ack at any time: each ack makes room for the next, so a long backlog leaves in
+  steps. A message that arrives once the backlog is over leaves at once.
+- Only one connection at a time: a new one closes the previous one with code 4000, and whatever
+  still arrives from the old one is ignored (at worst, a message is delivered twice; never
+  lost). An agent closed with code 4000 must stop instead of reconnecting: another agent has
+  taken its place, and two of them would split the messages between two journals.
 - The agent acknowledges an item as soon as it has written it to its own durable journal, not
   after processing it: from then on, retries and failures are the agent's business, and a slow
   or broken item never holds up the queue here.

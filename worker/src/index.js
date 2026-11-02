@@ -13,6 +13,8 @@
 // "Inbox" PRIMA di rispondere 200 a Telegram. Se l'agente è collegato il messaggio gli
 // viene spinto subito; altrimenti resta in coda e l'utente riceve un avviso.
 // Un elemento esce dalla coda solo quando l'agente conferma di averlo registrato al sicuro (ack).
+// Gli elementi partono verso l'agente da una sola strada (Inbox.pump): dopo il suo hello, in
+// ordine di arrivo, con al massimo AGENT_WINDOW elementi in attesa di ack.
 // /start lo gestisce il Worker; il comando di stato anche, ma solo ad agente scollegato: se
 // è collegato va a lui come ogni messaggio, e il Worker risponde solo se non lo conferma.
 //
@@ -63,16 +65,20 @@ async function handleTelegram(request, env, ctx) {
   }
 
   const msg = update.message ?? update.edited_message;
-  const from = msg?.from ?? update.callback_query?.from;
+  const query = update.callback_query;
+  const from = msg?.from ?? query?.from;
   if (!from || typeof update.update_id !== "number") {
     return new Response("ok"); // tipo di aggiornamento che non ci interessa
   }
+  // La chat dell'aggiornamento; per un pulsante, quella del messaggio del bot che lo porta. Un
+  // pulsante di un messaggio inline non ha una chat da verificare, e non passa.
+  const chat = msg ? msg.chat : query?.message?.chat;
 
   // Solo l'utente autorizzato, e solo in chat privata con il bot: in un gruppo le risposte
   // finirebbero sotto gli occhi di altri. Senza ALLOWED_USER_ID non passa nessuno.
   // Chiunque altro viene ignorato in silenzio, senza toccare la coda.
   const allowed = (env.ALLOWED_USER_ID ?? "").trim();
-  if (!allowed || String(from.id) !== allowed || (msg && msg.chat?.type !== "private")) {
+  if (!allowed || String(from.id) !== allowed || chat?.type !== "private") {
     return new Response("ok");
   }
 
@@ -177,14 +183,25 @@ async function reply(env, msg, text) {
   });
 }
 
+const TELEGRAM_TIMEOUT_MS = 10_000;
+
+// Ogni esito torna come risposta di Telegram ({ ok, ... }), anche rete assente e timeout: chi
+// chiama decide che cosa è un errore. La descrizione non riporta mai l'indirizzo, che contiene
+// il token.
 async function telegram(env, method, body) {
   const base = env.TELEGRAM_API_BASE || "https://api.telegram.org";
-  const res = await fetch(`${base}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
+  let data;
+  try {
+    const res = await fetch(`${base}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+    });
+    data = await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
+  } catch (err) {
+    data = { ok: false, description: err?.name === "TimeoutError" ? "timeout" : "Telegram non raggiungibile" };
+  }
   if (!data.ok) console.error(`Telegram ${method} fallito:`, data.description);
   return data;
 }
@@ -213,15 +230,21 @@ async function handleSetup(request, env, url) {
   if (missing.length) {
     return Response.json({ ok: false, description: `missing secrets: ${missing.join(", ")}` }, { status: 400 });
   }
+  const expected = `${url.origin}/telegram`;
   const webhook = await telegram(env, "setWebhook", {
-    url: `${url.origin}/telegram`,
+    url: expected,
     secret_token: env.WEBHOOK_SECRET,
     allowed_updates: ["message", "edited_message", "callback_query"],
     max_connections: 10,
   });
   const commands = await registerCommands(env);
   const info = await telegram(env, "getWebhookInfo", {});
-  return Response.json({ setWebhook: webhook, setMyCommands: commands, webhookInfo: info });
+  // Conta il webhook, verificato con getWebhookInfo: senza, il bot non riceve nulla. Il menu
+  // dei comandi è secondario e viene solo segnalato.
+  const ok = Boolean(webhook.ok && info.ok && info.result?.url === expected);
+  return Response.json(
+    { ok, commands: commands.every((r) => r.ok), setWebhook: webhook, setMyCommands: commands, webhookInfo: info },
+    { status: ok ? 200 : 502 });
 }
 
 // Il comando di stato nel menu, con nome e descrizione nella lingua dell'utente. Con LANGUAGE
@@ -293,13 +316,25 @@ export class Inbox extends DurableObject {
     return Math.max(auto, att.lastSeen ?? 0);
   }
 
-  agentSockets() {
-    return this.ctx.getWebSockets();
+  // La connessione corrente dell'agente: quella con il numero di sessione più recente. Le
+  // altre sono state sostituite, e possono restare per un po' tra quelle in chiusura.
+  currentSocket() {
+    const session = this.currentSession();
+    return this.ctx.getWebSockets().find((ws) => ws.deserializeAttachment()?.session === session) ?? null;
+  }
+
+  currentSession() {
+    return Number(this.getMeta("session") ?? 0);
   }
 
   isAgentOnline() {
-    const now = Date.now();
-    return this.agentSockets().some((ws) => now - this.lastActivity(ws) < this.timeoutMs());
+    const ws = this.currentSocket();
+    return ws !== null && Date.now() - this.lastActivity(ws) < this.timeoutMs();
+  }
+
+  windowSize() {
+    const n = Number(this.env.AGENT_WINDOW);
+    return Number.isInteger(n) && n > 0 ? n : 50;
   }
 
   pendingCount() {
@@ -333,19 +368,46 @@ export class Inbox extends DurableObject {
     const added = already.length === 0;
 
     if (added) {
-      const { id } = this.sql.exec(
-        "INSERT INTO queue (update_id, received_at, payload) VALUES (?, ?, ?) RETURNING id",
+      this.sql.exec(
+        "INSERT INTO queue (update_id, received_at, payload) VALUES (?, ?, ?)",
         update.update_id, Date.now(), payload
-      ).one();
-      const frame = `{"type":"update","id":${id},"update":${payload}}`;
-      // Lo spingiamo a ogni connessione aperta, anche se sembra inattiva:
-      // se l'agente è vivo lo riceve subito, altrimenti resta comunque in coda.
-      for (const ws of this.agentSockets()) {
-        try { ws.send(frame); } catch { /* connessione morta: resta in coda */ }
-      }
+      );
+      // Parte subito se l'agente è pronto e ha posto nella finestra, anche se la connessione
+      // sembra inattiva; altrimenti partirà dopo i precedenti. Intanto resta comunque in coda.
+      const ws = this.currentSocket();
+      if (ws) this.pump(ws);
       if (statusGrace) await this.scheduleAlarm(Date.now() + this.statusGraceMs());
     }
     return { added, agentOnline, lastSeen: this.lastSeenAt(), pending: this.pendingCount() };
+  }
+
+  // L'unica strada da cui gli elementi partono verso l'agente: dopo il suo hello, in ordine di
+  // arrivo, con al massimo windowSize() elementi in attesa di ack. Il cursore (l'ultimo id
+  // inviato) sta nell'allegato della connessione, che sopravvive all'ibernazione; ogni ack fa
+  // posto al successivo. Finito l'arretrato, backlog_end una volta sola.
+  pump(ws) {
+    const att = ws.deserializeAttachment() ?? {};
+    if (!att.ready) return;
+    let cursor = att.cursor ?? 0;
+    let caughtUp = att.caughtUp ?? false;
+    try {
+      const inFlight = this.sql.exec("SELECT COUNT(*) AS n FROM queue WHERE id <= ?", cursor).one().n;
+      const room = this.windowSize() - inFlight;
+      if (room > 0) {
+        const rows = this.sql.exec("SELECT id, payload FROM queue WHERE id > ? ORDER BY id LIMIT ?", cursor, room);
+        for (const row of rows) {
+          ws.send(`{"type":"update","id":${row.id},"update":${row.payload}}`);
+          cursor = row.id;
+        }
+      }
+      if (!caughtUp && this.sql.exec("SELECT COUNT(*) AS n FROM queue WHERE id > ?", cursor).one().n === 0) {
+        ws.send(JSON.stringify({ type: "backlog_end", pending: this.pendingCount() }));
+        caughtUp = true;
+      }
+    } catch (err) {
+      console.warn("invio all'agente non riuscito, gli elementi restano in coda:", err?.message ?? err);
+    }
+    ws.serializeAttachment({ ...att, cursor, caughtUp });
   }
 
   // Un solo allarme per oggetto: si anticipa se serve prima, non si posticipa mai.
@@ -383,29 +445,42 @@ export class Inbox extends DurableObject {
   }
 
   lastSeenAt() {
-    let lastSeen = Number(this.getMeta("last_seen") ?? 0);
-    for (const ws of this.agentSockets()) lastSeen = Math.max(lastSeen, this.lastActivity(ws));
+    const ws = this.currentSocket();
+    const lastSeen = Math.max(Number(this.getMeta("last_seen") ?? 0), ws ? this.lastActivity(ws) : 0);
     return lastSeen || null;
+  }
+
+  // L'ultimo contatto va solo avanti: la chiusura tardiva di una connessione vecchia non lo
+  // riporta indietro.
+  touchLastSeen(ts) {
+    if (ts > Number(this.getMeta("last_seen") ?? 0)) this.setMeta("last_seen", ts);
   }
 
   // Apertura della connessione WebSocket dell'agente (già autenticata dal Worker).
   async fetch(request) {
-    // Una sola connessione attiva: quelle vecchie (magari rimaste appese) vengono chiuse.
-    for (const old of this.agentSockets()) {
+    // Una sola connessione attiva, con un numero di sessione nuovo: quelle vecchie (magari
+    // rimaste appese) vengono chiuse con il codice 4000, e ciò che ne arriva ancora viene
+    // ignorato. Un loro ack tardivo non toglie nulla dalla coda: al massimo, un doppione.
+    for (const old of this.ctx.getWebSockets()) {
       try { old.close(4000, "sostituita da una nuova connessione"); } catch { /* già chiusa */ }
     }
+    const session = this.currentSession() + 1;
+    this.setMeta("session", session);
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server);
     const now = Date.now();
-    server.serializeAttachment({ connectedAt: now, lastSeen: now });
-    this.setMeta("last_seen", now);
+    // ready: l'agente ha mandato hello; cursor: l'ultimo elemento inviato; caughtUp: arretrato finito.
+    server.serializeAttachment({ session, connectedAt: now, lastSeen: now, ready: false, cursor: 0, caughtUp: false });
+    this.touchLastSeen(now);
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws, message) {
+    const att = ws.deserializeAttachment() ?? {};
+    if (att.session !== this.currentSession()) return; // connessione sostituita
     const now = Date.now();
-    ws.serializeAttachment({ ...(ws.deserializeAttachment() ?? {}), lastSeen: now });
-    this.setMeta("last_seen", now);
+    ws.serializeAttachment({ ...att, lastSeen: now });
+    this.touchLastSeen(now);
 
     let data;
     try {
@@ -413,27 +488,31 @@ export class Inbox extends DurableObject {
     } catch {
       return;
     }
+    if (data === null || typeof data !== "object") return;
 
     if (data.type === "hello") {
-      // L'agente è pronto: gli mandiamo tutto l'arretrato, in ordine di arrivo.
-      const rows = this.sql.exec("SELECT id, payload FROM queue ORDER BY id").toArray();
-      for (const row of rows) {
-        ws.send(`{"type":"update","id":${row.id},"update":${row.payload}}`);
-      }
-      ws.send(JSON.stringify({ type: "backlog_end", pending: rows.length }));
+      // L'agente è pronto: l'arretrato parte dal primo elemento in coda. Un secondo hello
+      // ricomincia da capo, e l'agente scarta ciò che ha già registrato.
+      ws.serializeAttachment({ ...att, lastSeen: now, ready: true, cursor: 0, caughtUp: false });
+      this.pump(ws);
     } else if (data.type === "ack" && Number.isInteger(data.id)) {
       // Solo ora l'elemento esce dalla coda: l'agente lo ha registrato al sicuro.
       this.sql.exec("DELETE FROM queue WHERE id = ?", data.id);
-      ws.send(JSON.stringify({ type: "acked", id: data.id, pending: this.pendingCount() }));
+      try {
+        ws.send(JSON.stringify({ type: "acked", id: data.id, pending: this.pendingCount() }));
+      } catch (err) {
+        console.warn("conferma all'agente non inviata:", err?.message ?? err);
+      }
+      this.pump(ws);
     }
   }
 
   async webSocketClose(ws, code, reason) {
-    this.setMeta("last_seen", this.lastActivity(ws));
+    this.touchLastSeen(this.lastActivity(ws));
     try { ws.close(code, reason); } catch { /* già chiusa */ }
   }
 
   async webSocketError(ws) {
-    this.setMeta("last_seen", this.lastActivity(ws));
+    this.touchLastSeen(this.lastActivity(ws));
   }
 }
