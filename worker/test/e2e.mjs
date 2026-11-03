@@ -20,10 +20,12 @@ const FIRST_NAME = "Ada";
 // ---------------------------------------------------------------- finto Telegram
 // Risponde come Telegram. I metodi in `failing` falliscono; getWebhookInfo restituisce l'URL
 // dell'ultimo setWebhook, oppure `foreignWebhook` per simulare un webhook rimasto altrove.
+// Con `replyDelay` sendMessage risponde in ritardo (la chiamata è annotata appena arriva).
 const calls = [];
 const failing = new Set();
 let webhookUrl = "";
 let foreignWebhook = null;
+let replyDelay = 0;
 const mock = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -39,7 +41,9 @@ const mock = http.createServer((req, res) => {
     }
     if (method === "setWebhook") webhookUrl = params.url;
     const result = method === "getWebhookInfo" ? { url: foreignWebhook ?? webhookUrl, pending_update_count: 0 } : true;
-    res.end(JSON.stringify({ ok: true, result }));
+    const answer = () => res.end(JSON.stringify({ ok: true, result }));
+    if (method === "sendMessage" && replyDelay) setTimeout(answer, replyDelay);
+    else answer();
   });
 });
 await new Promise((r) => mock.listen(0, "127.0.0.1", r));
@@ -158,6 +162,19 @@ function connectAgent(token = AGENT_TOKEN) {
     ws.on("error", reject);
   });
 }
+
+async function until(pred, ms = 3000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (pred()) return true;
+    await sleep(50);
+  }
+  return false;
+}
+
+// La risposta di riserva del Worker a un comando di stato, tra le chiamate a Telegram.
+const fallbackTo = (update, since) => calls.slice(since).filter((c) =>
+  c.method === "sendMessage" && c.body.reply_parameters?.message_id === update.message.message_id);
 
 async function waitFor(ws, pred, ms = 3000) {
   const end = Date.now() + ms;
@@ -508,6 +525,56 @@ try {
   const again = updatesIn(ws).map((m) => m.update.update_id);
   check("la nuova connessione riceve tutto ciò che non era confermato, e solo quello",
     JSON.stringify(again) === JSON.stringify([live.update_id, fromPrivate.update_id]), JSON.stringify(again));
+
+  // Da qui l'agente resta collegato (ping ogni mezzo secondo) e conferma solo quando lo dice il test.
+  const keepAlive = setInterval(() => ws.readyState === 1 && ws.send("ping"), 500);
+  const ackAll = async () => {
+    const open = updatesIn(ws).filter((m) => !ws.inbox.some((a) => a.type === "acked" && a.id === m.id));
+    for (const m of open) ws.send(JSON.stringify({ type: "ack", id: m.id }));
+    for (const m of open) await waitFor(ws, (a) => a.type === "acked" && a.id === m.id);
+  };
+  const received = (u) => updatesIn(ws).find((m) => m.update.update_id === u.update_id);
+  await ackAll();
+
+  // Finestra piena (3) con un comando di stato non confermato: quando il Worker risponde al
+  // posto dell'agente e toglie il comando dalla coda, l'elemento in attesa parte senza altri eventi.
+  n = calls.length;
+  const stuckStatus = makeUpdate("/stato");
+  const inWindow = [makeUpdate("prima"), makeUpdate("seconda")];
+  const queued = makeUpdate("in attesa di un posto");
+  for (const u of [stuckStatus, ...inWindow, queued]) await post(u);
+  await sleep(300);
+  const waitedForRoom = !received(queued);
+  const freed = await waitFor(ws, (m) => m.type === "update" && m.update.update_id === queued.update_id, 3000);
+  check("comando di stato scaduto con la finestra piena: risponde il Worker e l'elemento in attesa parte da solo",
+    waitedForRoom && Boolean(freed) && fallbackTo(stuckStatus, n).length === 1,
+    JSON.stringify({ waitedForRoom, freed: Boolean(freed), replies: fallbackTo(stuckStatus, n).length }));
+  await ackAll();
+
+  // Allarme e ack che si incrociano. Il Worker risponde in ritardo al primo comando; intanto
+  // ne arrivano altri due, che scadono mentre aspetta Telegram. L'allarme successivo li trova
+  // scaduti entrambi; mentre risponde al primo dei due, l'agente conferma il secondo, che
+  // quindi non deve ricevere la risposta di riserva.
+  n = calls.length;
+  replyDelay = 1500;
+  const slowFirst = makeUpdate("/stato");
+  await post(slowFirst);
+  await until(() => fallbackTo(slowFirst, n).length > 0, 3000);
+  const answered = makeUpdate("/stato");
+  const confirmedLate = makeUpdate("/stato");
+  await post(answered);
+  await post(confirmedLate);
+  await waitFor(ws, (m) => m.type === "update" && m.update.update_id === confirmedLate.update_id, 1000);
+  await until(() => fallbackTo(answered, n).length > 0, 6000);
+  ws.send(JSON.stringify({ type: "ack", id: received(confirmedLate)?.id }));
+  await waitFor(ws, (m) => m.type === "acked" && m.id === received(confirmedLate)?.id);
+  replyDelay = 0;
+  await sleep(2500);
+  const replies = [slowFirst, answered, confirmedLate].map((u) => fallbackTo(u, n).length);
+  check("un comando confermato mentre il Worker risponde a un altro non riceve la risposta di riserva",
+    JSON.stringify(replies) === "[1,1,0]", JSON.stringify(replies));
+  await ackAll();
+  clearInterval(keepAlive);
   ws.close();
 
   failing.add("setWebhook");

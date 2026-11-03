@@ -37,6 +37,12 @@ npx wrangler tail                  # log in tempo reale del Worker pubblicato
 - Gli elementi partono verso l'agente solo da `Inbox.pump()`: dopo `hello`, in ordine, con al
   massimo `AGENT_WINDOW` in attesa di ack. Non aggiungere altre strade: ordine e finestra
   dipendono da questo. Ciò che arriva da una connessione sostituita (sessione vecchia) si ignora.
+  Ogni volta che un elemento lascia la coda (ack o risposta di riserva a `/stato`) si richiama
+  `pump()`, altrimenti il posto liberato resta vuoto.
+- Niente letture dell'intera coda: si legge solo ciò che serve, con un limite (la finestra,
+  oppure i comandi di stato scaduti uno alla volta, dalla colonna `status_deadline`). Dopo ogni
+  attesa di rete (`await` verso Telegram) lo stato si rilegge dalla coda: nel frattempo possono
+  arrivare ack e messaggi.
 - Un messaggio va scritto nella coda PRIMA di rispondere 200 a Telegram, ed esce dalla coda
   solo con l'ack dell'agente: non cambiare quest'ordine, è ciò che garantisce di non perdere nulla.
 - Il repository è pubblico: niente che permetta di raggiungere un'istanza (nome del Worker,

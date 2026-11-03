@@ -290,16 +290,24 @@ export class Inbox extends DurableObject {
     this.sql = ctx.storage.sql;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS queue (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        update_id   INTEGER NOT NULL UNIQUE,
-        received_at INTEGER NOT NULL,
-        payload     TEXT    NOT NULL
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        update_id       INTEGER NOT NULL UNIQUE,
+        received_at     INTEGER NOT NULL,
+        payload         TEXT    NOT NULL,
+        status_deadline INTEGER
       );
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
     `);
+    // status_deadline: per un comando di stato passato all'agente, quando risponde il Worker se
+    // l'agente non lo ha confermato; vuoto per tutto il resto. Le code di prima non l'hanno.
+    if (!this.sql.exec("PRAGMA table_info(queue)").toArray().some((c) => c.name === "status_deadline")) {
+      this.sql.exec("ALTER TABLE queue ADD COLUMN status_deadline INTEGER");
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS queue_status_deadline ON queue (status_deadline)
+                   WHERE status_deadline IS NOT NULL`);
     // L'agente manda "ping" ogni ~30 s: la risposta automatica non risveglia
     // l'oggetto e ne registra l'orario, usato per capire se l'agente è vivo.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -368,15 +376,16 @@ export class Inbox extends DurableObject {
     const added = already.length === 0;
 
     if (added) {
+      const deadline = statusGrace ? Date.now() + this.statusGraceMs() : null;
       this.sql.exec(
-        "INSERT INTO queue (update_id, received_at, payload) VALUES (?, ?, ?)",
-        update.update_id, Date.now(), payload
+        "INSERT INTO queue (update_id, received_at, payload, status_deadline) VALUES (?, ?, ?, ?)",
+        update.update_id, Date.now(), payload, deadline
       );
       // Parte subito se l'agente è pronto e ha posto nella finestra, anche se la connessione
       // sembra inattiva; altrimenti partirà dopo i precedenti. Intanto resta comunque in coda.
       const ws = this.currentSocket();
       if (ws) this.pump(ws);
-      if (statusGrace) await this.scheduleAlarm(Date.now() + this.statusGraceMs());
+      if (deadline !== null) await this.scheduleAlarm(deadline);
     }
     return { added, agentOnline, lastSeen: this.lastSeenAt(), pending: this.pendingCount() };
   }
@@ -419,24 +428,31 @@ export class Inbox extends DurableObject {
   // Un comando di stato passato all'agente e non confermato entro il tempo previsto riceve la
   // risposta del Worker e lascia la coda: è una domanda, non un contenuto da custodire. Se
   // Telegram non risponde, l'eccezione fa ripetere l'allarme e il comando resta in coda.
+  // Si legge un comando scaduto alla volta, e solo quello: la memoria non dipende dalla coda, e
+  // dopo ogni attesa di Telegram la coda si rilegge, così un comando confermato nel frattempo
+  // dall'agente non riceve la risposta di riserva. Resta un caso: se l'ack arriva proprio mentre
+  // parte la risposta a quel comando, rispondono tutti e due (meglio una risposta in più che
+  // nessuna). Ogni comando tolto libera un posto nella finestra: alla fine riparte la consegna.
   async alarm() {
-    const now = Date.now();
-    const grace = this.statusGraceMs();
-    let next = null;
-    const rows = this.sql.exec("SELECT id, received_at, payload FROM queue ORDER BY id").toArray();
-    for (const row of rows) {
-      const update = JSON.parse(row.payload);
-      const msg = update.message ?? update.edited_message;
-      if (!STATUS_COMMANDS.has(commandOf(msg))) continue;
-      if (now - row.received_at < grace) {
-        next = Math.min(next ?? Infinity, row.received_at + grace);
-        continue;
+    try {
+      for (;;) {
+        const row = this.sql.exec(
+          "SELECT id, payload FROM queue WHERE status_deadline <= ? ORDER BY status_deadline, id LIMIT 1",
+          Date.now()
+        ).toArray()[0];
+        if (!row) break;
+        const update = JSON.parse(row.payload);
+        const msg = update.message ?? update.edited_message;
+        const sent = await reply(this.env, msg, silentStatusText(this.env, msg.from, this.pendingCount() - 1));
+        if (!sent.ok) throw new Error(`risposta di riserva non inviata: ${sent.description}`);
+        this.sql.exec("DELETE FROM queue WHERE id = ?", row.id);
       }
-      const sent = await reply(this.env, msg, silentStatusText(this.env, msg.from, this.pendingCount() - 1));
-      if (!sent.ok) throw new Error(`risposta di riserva non inviata: ${sent.description}`);
-      this.sql.exec("DELETE FROM queue WHERE id = ?", row.id);
+      const next = this.sql.exec("SELECT MIN(status_deadline) AS at FROM queue").one().at;
+      if (next !== null) await this.ctx.storage.setAlarm(next);
+    } finally {
+      const ws = this.currentSocket();
+      if (ws) this.pump(ws);
     }
-    if (next !== null) await this.ctx.storage.setAlarm(next);
   }
 
   // RPC per /start e il comando di stato.

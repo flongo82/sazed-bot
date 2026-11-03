@@ -242,7 +242,11 @@ Messages on the WebSocket:
   When the agent is connected, the command is delivered to it like any other message, since
   only the agent knows its own journal. If the agent does not acknowledge it within
   `AGENT_STATUS_GRACE_SECONDS` (15 by default), a Durable Object alarm makes the Worker answer
-  by itself ("connected but not responding") and drop the command from the queue.
+  by itself ("connected but not responding") and drop the command from the queue; the room it
+  frees in the window goes at once to the next message. The alarm reads only the expired
+  commands, one at a time, and checks the queue again after each answer, so a command the agent
+  acknowledges meanwhile gets no fallback. If the ack lands while the fallback for that very
+  command is being sent, the user gets both answers: one too many, never none.
 
 ## Uninstall
 
