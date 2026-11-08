@@ -19,7 +19,7 @@ when I took this photo?*, and the answers come back in the same chat.
 | Part | Role | Where it runs |
 |---|---|---|
 | `sazed-bot` (this repository) | The always-open door: receives the messages and keeps them queued | Cloudflare Workers, free plan |
-| `sazed-agent` | The mind: reads each message (transcripts, pages, documents, photos), decides whether to keep it, answer it or both, and replies | Your own computer — in development |
+| [`sazed-agent`](https://github.com/flongo82/sazed-agent) | The mind: reads each message (transcripts, pages, documents, photos), decides whether to keep it, answer it or both, and replies | Your own computer, in a Podman container |
 | coppermind | The memory: a SQLite catalogue with full-text and semantic search | Inside `sazed-agent` |
 
 In Brandon Sanderson's *Mistborn*, Sazed is a Terrisman Keeper who stores knowledge in
@@ -190,7 +190,8 @@ and a reason. The address is saved in `secrets/worker_url` only once everything 
   Once the agent is running and takes the message, that notice disappears from the chat.
 - From another Telegram account, the bot must stay silent.
 
-The queued messages will be processed once `sazed-agent` is running.
+The queued messages will be processed once [`sazed-agent`](https://github.com/flongo82/sazed-agent)
+is running: its README explains how to set it up.
 
 ## Daily use
 
