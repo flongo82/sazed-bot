@@ -187,6 +187,7 @@ and a reason. The address is saved in `secrets/worker_url` only once everything 
   name and tells you whether the agent is connected and how many messages are waiting to be
   processed.
 - Send a link: the bot replies that the agent is not connected and the message is queued.
+  Once the agent is running and takes the message, that notice disappears from the chat.
 - From another Telegram account, the bot must stay silent.
 
 The queued messages will be processed once `sazed-agent` is running.
@@ -234,6 +235,11 @@ Messages on the WebSocket:
 - The agent acknowledges an item as soon as it has written it to its own durable journal, not
   after processing it: from then on, retries and failures are the agent's business, and a slow
   or broken item never holds up the queue here.
+- The "agent not connected" notice the Worker sends for a queued message is deleted from the
+  chat when that message is acknowledged (or right after it is sent, if the ack came first). The
+  agent knows nothing about it: the Worker keeps the notice's message id next to the queued item.
+  Telegram lets bots delete their messages for 48 hours only, so after a longer absence the
+  notice stays.
 - An item that was not acknowledged is delivered again on the next connection, so the agent
   must skip the `update_id`s it has already recorded.
 - `/start` is answered by the Worker itself; everything else goes to the agent.

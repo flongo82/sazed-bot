@@ -21,7 +21,9 @@ const FIRST_NAME = "Ada";
 // Risponde come Telegram. I metodi in `failing` falliscono; getWebhookInfo restituisce l'URL
 // dell'ultimo setWebhook, oppure `foreignWebhook` per simulare un webhook rimasto altrove.
 // Con `replyDelay` sendMessage risponde in ritardo (la chiamata è annotata appena arriva).
+// Ogni messaggio del bot ha il suo message_id, annotato con la chiamata (result).
 const calls = [];
+let botMessageId = 5000;
 const failing = new Set();
 let webhookUrl = "";
 let foreignWebhook = null;
@@ -32,7 +34,8 @@ const mock = http.createServer((req, res) => {
   req.on("end", () => {
     const method = req.url.split("/").pop();
     const params = body ? JSON.parse(body) : {};
-    calls.push({ method, body: params });
+    const call = { method, body: params };
+    calls.push(call);
     res.setHeader("content-type", "application/json");
     if (failing.has(method)) {
       res.statusCode = 500;
@@ -40,7 +43,9 @@ const mock = http.createServer((req, res) => {
       return;
     }
     if (method === "setWebhook") webhookUrl = params.url;
-    const result = method === "getWebhookInfo" ? { url: foreignWebhook ?? webhookUrl, pending_update_count: 0 } : true;
+    const result = method === "getWebhookInfo" ? { url: foreignWebhook ?? webhookUrl, pending_update_count: 0 }
+      : method === "sendMessage" ? { message_id: botMessageId++ } : true;
+    call.result = result;
     const answer = () => res.end(JSON.stringify({ ok: true, result }));
     if (method === "sendMessage" && replyDelay) setTimeout(answer, replyDelay);
     else answer();
@@ -457,6 +462,7 @@ try {
   console.log("Fase 5: consegna all'agente, callback e setup, archivio nuovo");
   delivery = mkdtempSync(join(tmpdir(), "sazed-bot-test-"));
   await startWorker(String(USER), "auto", delivery);
+  const beforeBacklog = calls.length;
   const backlog = [];
   for (let i = 0; i < 7; i++) {
     backlog.push(makeUpdate(`nota ${i}`));
@@ -490,6 +496,14 @@ try {
   const lastIndex = ws.inbox.findIndex((m) => m.type === "update" && m.update.update_id === early.update_id);
   check("backlog_end una volta sola, dopo l'ultimo elemento dell'arretrato",
     ends.length === 1 && ws.inbox.indexOf(ends[0]) > lastIndex, JSON.stringify(ends));
+  // L'avviso "agente non collegato" di un messaggio sparisce dalla chat quando l'agente lo conferma.
+  const notices = calls.slice(beforeBacklog).filter((x) => x.method === "sendMessage" &&
+    backlog.some((u) => x.body.reply_parameters?.message_id === u.message.message_id));
+  const deletions = () => calls.slice(beforeBacklog).filter((x) => x.method === "deleteMessage");
+  const allGone = await until(() => notices.length === 7 && notices.every((x) => deletions().some((d) =>
+    d.body.chat_id === USER && d.body.message_id === x.result.message_id)));
+  check("all'ack di ogni messaggio dell'arretrato il suo avviso di agente scollegato sparisce dalla chat",
+    allGone && deletions().length === 7, JSON.stringify({ notices: notices.length, deleted: deletions().map((d) => d.body) }));
   const live = makeUpdate("in diretta");
   await post(live);
   check("finito l'arretrato, un messaggio nuovo arriva subito",
@@ -575,6 +589,44 @@ try {
     JSON.stringify(replies) === "[1,1,0]", JSON.stringify(replies));
   await ackAll();
   clearInterval(keepAlive);
+  ws.close();
+
+  // L'agente si collega e conferma mentre l'avviso sta ancora partendo: il Worker lo toglie appena
+  // Telegram gliene dà il message_id.
+  await sleep(3500); // agente scollegato (3 s nel test)
+  n = calls.length;
+  replyDelay = 1500;
+  const racing = makeUpdate("https://example.com/di-corsa");
+  await post(racing);
+  ws = await connectAgent();
+  ws.send(JSON.stringify({ type: "hello" }));
+  const racingMsg = await waitFor(ws, (m) => m.type === "update" && m.update.update_id === racing.update_id);
+  ws.send(JSON.stringify({ type: "ack", id: racingMsg?.id }));
+  await waitFor(ws, (m) => m.type === "acked" && m.id === racingMsg?.id);
+  const racingNotice = () => calls.slice(n).find((x) => x.method === "sendMessage" &&
+    x.body.reply_parameters?.message_id === racing.message.message_id);
+  const goneAtOnce = await until(() => calls.slice(n).some((x) => x.method === "deleteMessage" &&
+    x.body.message_id === racingNotice()?.result.message_id), 4000);
+  replyDelay = 0;
+  check("se l'agente conferma mentre l'avviso parte, l'avviso sparisce appena inviato",
+    Boolean(racingNotice()) && goneAtOnce, JSON.stringify(calls.slice(n).map((x) => x.method)));
+  ws.close();
+
+  // Telegram non cancella (avviso di più di 48 ore, o già cancellato dall'utente): l'ack vale lo stesso.
+  await sleep(3500);
+  failing.add("deleteMessage");
+  const stubborn = makeUpdate("avviso che non si cancella");
+  await post(stubborn);
+  await sleep(300);
+  ws = await connectAgent();
+  ws.send(JSON.stringify({ type: "hello" }));
+  const stubbornMsg = await waitFor(ws, (m) => m.type === "update" && m.update.update_id === stubborn.update_id);
+  ws.send(JSON.stringify({ type: "ack", id: stubbornMsg?.id }));
+  const stubbornAck = await waitFor(ws, (m) => m.type === "acked" && m.id === stubbornMsg?.id);
+  await sleep(500);
+  check("un avviso che Telegram non cancella non ferma l'ack né la coda",
+    stubbornAck?.pending === 0 && !/TypeError|Uncaught/.test(devLog), JSON.stringify(stubbornAck));
+  failing.clear();
   ws.close();
 
   failing.add("setWebhook");

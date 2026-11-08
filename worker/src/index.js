@@ -11,7 +11,8 @@
 //
 // Ogni messaggio dell'utente autorizzato viene salvato nella coda del Durable Object
 // "Inbox" PRIMA di rispondere 200 a Telegram. Se l'agente è collegato il messaggio gli
-// viene spinto subito; altrimenti resta in coda e l'utente riceve un avviso.
+// viene spinto subito; altrimenti resta in coda e l'utente riceve un avviso, che il Worker
+// toglie dalla chat quando l'agente prende in carico il messaggio.
 // Un elemento esce dalla coda solo quando l'agente conferma di averlo registrato al sicuro (ack).
 // Gli elementi partono verso l'agente da una sola strada (Inbox.pump): dopo il suo hello, in
 // ordine di arrivo, con al massimo AGENT_WINDOW elementi in attesa di ack.
@@ -111,7 +112,7 @@ async function handleTelegram(request, env, ctx) {
     notify(ctx, env, msg, () => {
       const { t, hello, name } = voice(env, from);
       return `${hello}, ${agentText(t, result, name)}: ${t.queued}. ${t.pending(result.pending)}`;
-    });
+    }, (sent) => inbox.noticeSent(update.update_id, msg.chat.id, sent.message_id));
   }
   return new Response("ok");
 }
@@ -124,10 +125,13 @@ function voice(env, from) {
 }
 
 // Risponde in background. Un errore nel comporre o nell'inviare il testo finisce nei log e
-// non diventa un 500: Telegram non ripete l'aggiornamento per una risposta mancata.
-function notify(ctx, env, msg, compose) {
-  ctx.waitUntil((async () => reply(env, msg, compose()))().catch((err) =>
-    console.error("risposta non inviata", err?.stack ?? err)));
+// non diventa un 500: Telegram non ripete l'aggiornamento per una risposta mancata. Con sent,
+// a risposta inviata le passa il messaggio del bot (per l'avviso: il suo message_id).
+function notify(ctx, env, msg, compose, sent = null) {
+  ctx.waitUntil((async () => {
+    const data = await reply(env, msg, compose());
+    if (data.ok && sent) await sent(data.result);
+  })().catch((err) => console.error("risposta non inviata", err?.stack ?? err)));
 }
 
 // Lingua dei testi: LANGUAGE = "auto" (quella dell'app Telegram dell'utente), "it" o "en".
@@ -173,6 +177,12 @@ function relativeTime(t, ts) {
   const h = Math.round(min / 60);
   if (h < 48) return t.ago.hours(h);
   return t.ago.days(Math.round(h / 24));
+}
+
+// Toglie dalla chat un avviso del Worker. Telegram lo permette entro 48 ore: dopo, o se
+// l'utente l'ha già cancellato, l'avviso resta e l'errore finisce solo nei log.
+async function deleteNotice(env, chatId, messageId) {
+  await telegram(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
 }
 
 async function reply(env, msg, text) {
@@ -294,7 +304,9 @@ export class Inbox extends DurableObject {
         update_id       INTEGER NOT NULL UNIQUE,
         received_at     INTEGER NOT NULL,
         payload         TEXT    NOT NULL,
-        status_deadline INTEGER
+        status_deadline INTEGER,
+        notice_chat     INTEGER,
+        notice_id       INTEGER
       );
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -302,9 +314,12 @@ export class Inbox extends DurableObject {
       );
     `);
     // status_deadline: per un comando di stato passato all'agente, quando risponde il Worker se
-    // l'agente non lo ha confermato; vuoto per tutto il resto. Le code di prima non l'hanno.
-    if (!this.sql.exec("PRAGMA table_info(queue)").toArray().some((c) => c.name === "status_deadline")) {
-      this.sql.exec("ALTER TABLE queue ADD COLUMN status_deadline INTEGER");
+    // l'agente non lo ha confermato; vuoto per tutto il resto. notice_chat e notice_id: l'avviso
+    // "agente non collegato" mandato per questo messaggio, da togliere all'ack. Le code di prima
+    // non hanno queste colonne.
+    const columns = this.sql.exec("PRAGMA table_info(queue)").toArray().map((c) => c.name);
+    for (const column of ["status_deadline", "notice_chat", "notice_id"]) {
+      if (!columns.includes(column)) this.sql.exec(`ALTER TABLE queue ADD COLUMN ${column} INTEGER`);
     }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS queue_status_deadline ON queue (status_deadline)
                    WHERE status_deadline IS NOT NULL`);
@@ -455,6 +470,18 @@ export class Inbox extends DurableObject {
     }
   }
 
+  // RPC: l'avviso "agente non collegato" mandato per un messaggio in coda. Si annota, per
+  // toglierlo dalla chat quando l'agente conferma il messaggio; se l'agente lo ha già
+  // confermato mentre l'avviso partiva, si toglie subito.
+  async noticeSent(updateId, chatId, messageId) {
+    const row = this.sql.exec("SELECT id FROM queue WHERE update_id = ?", updateId).toArray()[0];
+    if (row) {
+      this.sql.exec("UPDATE queue SET notice_chat = ?, notice_id = ? WHERE id = ?", chatId, messageId, row.id);
+    } else {
+      await deleteNotice(this.env, chatId, messageId);
+    }
+  }
+
   // RPC per /start e il comando di stato.
   async status() {
     return { agentOnline: this.isAgentOnline(), lastSeen: this.lastSeenAt(), pending: this.pendingCount() };
@@ -512,7 +539,10 @@ export class Inbox extends DurableObject {
       ws.serializeAttachment({ ...att, lastSeen: now, ready: true, cursor: 0, caughtUp: false });
       this.pump(ws);
     } else if (data.type === "ack" && Number.isInteger(data.id)) {
-      // Solo ora l'elemento esce dalla coda: l'agente lo ha registrato al sicuro.
+      // Solo ora l'elemento esce dalla coda: l'agente lo ha registrato al sicuro. Con lui se ne
+      // va l'avviso mandato all'utente, se c'era: la promessa è mantenuta.
+      const notice = this.sql.exec("SELECT notice_chat, notice_id FROM queue WHERE id = ? AND notice_id IS NOT NULL",
+        data.id).toArray()[0];
       this.sql.exec("DELETE FROM queue WHERE id = ?", data.id);
       try {
         ws.send(JSON.stringify({ type: "acked", id: data.id, pending: this.pendingCount() }));
@@ -520,6 +550,7 @@ export class Inbox extends DurableObject {
         console.warn("conferma all'agente non inviata:", err?.message ?? err);
       }
       this.pump(ws);
+      if (notice) await deleteNotice(this.env, notice.notice_chat, notice.notice_id);
     }
   }
 
