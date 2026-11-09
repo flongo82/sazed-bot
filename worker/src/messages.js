@@ -1,5 +1,7 @@
 // Testi del bot, una voce per lingua: nessun testo rivolto all'utente sta nel codice, nemmeno
-// il nome del comando di stato (statusCommand: lettere minuscole, cifre e trattini bassi).
+// i nomi dei comandi del menu (statusCommand e balanceCommand: lettere minuscole, cifre e
+// trattini bassi). Al bilancio risponde sempre l'agente: qui stanno solo nome e descrizione,
+// uguali a quelli del catalogo di sazed-agent.
 // Per aggiungere una lingua basta aggiungere qui un blocco con le stesse chiavi: configure.sh
 // e i test la trovano da soli. La lingua si sceglie con LANGUAGE in wrangler.jsonc.
 
@@ -22,6 +24,8 @@ export const MESSAGES = {
     },
     statusCommand: "stato",
     statusDescription: "Stato dell'agente e dei messaggi da processare",
+    balanceCommand: "bilancio",
+    balanceDescription: "Quanti messaggi ho elaborato, quanti sono da riprovare",
   },
   en: {
     hello: (first) => (first ? `Hi ${first}` : "Hi"),
@@ -41,5 +45,7 @@ export const MESSAGES = {
     },
     statusCommand: "status",
     statusDescription: "Status of the agent and of the messages to process",
+    balanceCommand: "balance",
+    balanceDescription: "How many messages I processed, how many to retry",
   },
 };

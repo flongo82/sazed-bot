@@ -257,7 +257,7 @@ async function handleSetup(request, env, url) {
     { status: ok ? 200 : 502 });
 }
 
-// Il comando di stato nel menu, con nome e descrizione nella lingua dell'utente. Con LANGUAGE
+// I comandi del menu (stato e bilancio), con nomi e descrizioni nella lingua dell'utente. Con LANGUAGE
 // "auto" una versione per lingua (Telegram mostra quella dell'app dell'utente, l'inglese per
 // tutte le altre); con una lingua fissa solo quella, togliendo le versioni per lingua
 // registrate in precedenza.
@@ -265,17 +265,20 @@ async function registerCommands(env) {
   const setting = languageSetting(env);
   const auto = setting === "auto";
   const base = auto ? MESSAGES.en : MESSAGES[setting] ?? MESSAGES.en;
-  const results = [await telegram(env, "setMyCommands", {
-    commands: [{ command: base.statusCommand, description: base.statusDescription }],
-  })];
+  const results = [await telegram(env, "setMyCommands", { commands: menu(base) })];
   for (const [code, t] of Object.entries(MESSAGES)) {
     results.push(auto
-      ? await telegram(env, "setMyCommands", {
-          commands: [{ command: t.statusCommand, description: t.statusDescription }], language_code: code,
-        })
+      ? await telegram(env, "setMyCommands", { commands: menu(t), language_code: code })
       : await telegram(env, "deleteMyCommands", { language_code: code }));
   }
   return results;
+}
+
+function menu(t) {
+  return [
+    { command: t.statusCommand, description: t.statusDescription },
+    { command: t.balanceCommand, description: t.balanceDescription },
+  ];
 }
 
 // ---------------------------------------------------------------- utilità

@@ -244,6 +244,8 @@ Messages on the WebSocket:
 - An item that was not acknowledged is delivered again on the next connection, so the agent
   must skip the `update_id`s it has already recorded.
 - `/start` is answered by the Worker itself; everything else goes to the agent.
+- The balance command (`/bilancio` in Italian, `/balance` in English) is in the command menu
+  too, but for the Worker it is a message like any other: only the agent answers it.
 - The status command (`/stato` in Italian, `/status` in English, both always accepted; its
   name comes from the text catalog) is answered by the Worker only while the agent is offline.
   When the agent is connected, the command is delivered to it like any other message, since

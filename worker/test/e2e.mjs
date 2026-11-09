@@ -204,9 +204,10 @@ try {
     LANGS.every((l) => JSON.stringify(shape(MESSAGES[l])) === JSON.stringify(shape(MESSAGES.it))), LANGS.join(","));
   check("ogni testo di ogni lingua è una stringa piena",
     LANGS.every((l) => texts(MESSAGES[l]).every((s) => typeof s === "string" && s.length > 0 && !s.includes("undefined"))));
-  check("il comando di stato ha un nome e una descrizione validi per Telegram in ogni lingua",
-    LANGS.every((l) => /^[a-z0-9_]{1,32}$/.test(MESSAGES[l].statusCommand) &&
-      MESSAGES[l].statusDescription.length <= 256));
+  check("i comandi del menu hanno nomi e descrizioni validi per Telegram in ogni lingua, nomi diversi",
+    LANGS.every((l) => [["statusCommand", "statusDescription"], ["balanceCommand", "balanceDescription"]]
+      .every(([c, d]) => /^[a-z0-9_]{1,32}$/.test(MESSAGES[l][c]) && MESSAGES[l][d].length <= 256) &&
+      MESSAGES[l].statusCommand !== MESSAGES[l].balanceCommand));
   const { it, en } = MESSAGES;
   check("saluto senza nome, se Telegram non lo manda", it.hello() === "Ciao" && en.hello() === "Hi");
   check("tempi relativi, singolare e plurale",
@@ -379,17 +380,17 @@ try {
   const sw = c.find((x) => x.method === "setWebhook");
   check("/setup registra il webhook con URL e segreto giusti",
     r.ok && sw?.body.url === `${BASE}/telegram` && sw?.body.secret_token === SECRET, JSON.stringify(sw));
-  // Il comando registrato per una lingua (undefined = la lista di base), come "nome: descrizione".
-  const listed = (code) => {
-    const cmd = c.find((x) => x.method === "setMyCommands" && x.body.language_code === code)?.body.commands?.[0];
-    return cmd && `${cmd.command}: ${cmd.description}`;
-  };
+  // I comandi registrati per una lingua (undefined = la lista di base), come "nome: descrizione | …".
+  const listed = (code) => c.find((x) => x.method === "setMyCommands" && x.body.language_code === code)
+    ?.body.commands?.map((cmd) => `${cmd.command}: ${cmd.description}`).join(" | ");
+  const EN_MENU = "status: Status of the agent and of the messages to process | " +
+    "balance: How many messages I processed, how many to retry";
   const perLanguage = c.filter((x) => x.method === "setMyCommands" && x.body.language_code)
     .map((x) => x.body.language_code).sort();
-  check("/setup con LANGUAGE auto registra il comando di stato in ogni lingua del catalogo, inglese come base",
-    listed(undefined) === "status: Status of the agent and of the messages to process" &&
-    listed("en") === "status: Status of the agent and of the messages to process" &&
-    listed("it") === "stato: Stato dell'agente e dei messaggi da processare" &&
+  check("/setup con LANGUAGE auto registra stato e bilancio in ogni lingua del catalogo, inglese come base",
+    listed(undefined) === EN_MENU && listed("en") === EN_MENU &&
+    listed("it") === "stato: Stato dell'agente e dei messaggi da processare | " +
+      "bilancio: Quanti messaggi ho elaborato, quanti sono da riprovare" &&
     perLanguage.join(",") === LANGS.join(","),
     JSON.stringify(c.filter((x) => x.method === "setMyCommands")));
 
@@ -424,9 +425,9 @@ try {
   c = await newCalls(n, 100);
   const sets = c.filter((x) => x.method === "setMyCommands");
   const deleted = c.filter((x) => x.method === "deleteMyCommands").map((x) => x.body.language_code).sort();
-  check("/setup con LANGUAGE fisso: un solo comando nella lingua scelta, versioni per lingua rimosse",
+  check("/setup con LANGUAGE fisso: un solo menu nella lingua scelta, versioni per lingua rimosse",
     r.ok && sets.length === 1 && sets[0].body.language_code === undefined &&
-    sets[0].body.commands?.[0]?.command === "stato" &&
+    sets[0].body.commands?.map((x) => x.command).join(",") === "stato,bilancio" &&
     sets[0].body.commands?.[0]?.description === "Stato dell'agente e dei messaggi da processare" &&
     deleted.join(",") === LANGS.join(","),
     JSON.stringify(c));
